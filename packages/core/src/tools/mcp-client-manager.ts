@@ -995,6 +995,7 @@ export class McpClientManager {
             this.cliConfig.getWorkspaceContext(),
             this.cliConfig.getDebugMode(),
             sdkCallback,
+            this.cliConfig.getInputFile?.(),
           );
           this.clients.set(name, client);
 
@@ -1217,6 +1218,7 @@ export class McpClientManager {
       this.cliConfig.getWorkspaceContext(),
       this.cliConfig.getDebugMode(),
       sdkCallback,
+      this.cliConfig.getInputFile?.(),
     );
 
     this.clients.set(serverName, client);

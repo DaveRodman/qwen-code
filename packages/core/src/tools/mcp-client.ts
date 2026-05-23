@@ -4,6 +4,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
+import { appendFile } from 'node:fs/promises';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import type { SSEClientTransportOptions } from '@modelcontextprotocol/sdk/client/sse.js';
 import { SSEClientTransport } from '@modelcontextprotocol/sdk/client/sse.js';
@@ -111,6 +112,16 @@ export class McpClient {
     private readonly workspaceContext: WorkspaceContext,
     private readonly debugMode: boolean,
     private readonly sendSdkMcpMessage?: SendSdkMcpMessage,
+    /**
+     * Optional path to the JSONL input file watched by RemoteInputWatcher
+     * (the `--input-file` flag). When set, MCP notifications whose method
+     * indicates an incoming peer message (currently `notifications/claude/channel`,
+     * as emitted by the claude-peers MCP server) are translated into
+     * `{type:"submit"}` lines appended here. The TUI then surfaces the
+     * message as if the user typed it, giving qwen-code parity with Claude
+     * Code's push-delivery behavior for inter-agent messaging.
+     */
+    private readonly remoteInputFile?: string,
   ) {
     this.client = new Client({
       name: `qwen-cli-mcp-client-${this.serverName}`,
@@ -138,6 +149,57 @@ export class McpClient {
       this.client.registerCapabilities({
         roots: {},
       });
+
+      // Handle inbound peer-message notifications from MCP servers that
+      // implement the `notifications/claude/channel` push protocol (notably
+      // the claude-peers MCP). Without this handler, the notification is
+      // silently dropped, and inbound messages would only arrive when the
+      // model proactively polls via the `check_messages` tool — which
+      // breaks coordinator → worker communication patterns. By translating
+      // the notification into a remote-input `submit` command, the message
+      // surfaces in the TUI as if the user typed it, matching Claude Code's
+      // push-delivery behavior. Falls through to other handlers (or
+      // silently drops, as before) when remoteInputFile is unset or the
+      // notification isn't a recognized peer-channel push.
+      const fileForNotifications = this.remoteInputFile;
+      const debugLog = this.debugMode
+        ? (msg: string) => debugLogger.debug(msg)
+        : undefined;
+      this.client.fallbackNotificationHandler = async (notification) => {
+        if (notification.method !== 'notifications/claude/channel') return;
+        if (!fileForNotifications) {
+          debugLog?.(
+            `claude/channel notification received but --input-file not set; dropping. Pass --input-file to enable push delivery.`,
+          );
+          return;
+        }
+        const params = (notification.params ?? {}) as {
+          content?: unknown;
+          meta?: { from_id?: unknown; from_summary?: unknown };
+        };
+        const text = typeof params.content === 'string' ? params.content : '';
+        if (!text) return;
+        const fromId =
+          typeof params.meta?.from_id === 'string'
+            ? params.meta.from_id
+            : 'unknown';
+        const submitLine =
+          JSON.stringify({
+            type: 'submit',
+            text: `[peer-message from ${fromId} via ${this.serverName}]\n${text}`,
+          }) + '\n';
+        try {
+          await appendFile(fileForNotifications, submitLine, 'utf-8');
+          debugLog?.(
+            `Forwarded claude/channel notification from ${fromId} to ${fileForNotifications}`,
+          );
+        } catch (err) {
+          debugLogger.error(
+            `Failed to append peer message to ${fileForNotifications}:`,
+            err instanceof Error ? err.message : String(err),
+          );
+        }
+      };
 
       this.client.setRequestHandler(ListRootsRequestSchema, async () => {
         const roots = [];
