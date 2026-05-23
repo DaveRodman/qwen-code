@@ -37,6 +37,8 @@ import type { ControlService } from './nonInteractive/control/ControlService.js'
 
 import { handleSlashCommand } from './nonInteractiveCliCommands.js';
 import { handleAtCommand } from './ui/hooks/atCommandProcessor.js';
+import { RemoteInputWatcher } from './remoteInput/RemoteInputWatcher.js';
+import { writeStderrLine } from './utils/stdioHelpers.js';
 import {
   AlreadyReportedError,
   handleError,
@@ -219,6 +221,51 @@ export async function runNonInteractive(
 
     const geminiClient = config.getGeminiClient();
     const abortController = options.abortController ?? new AbortController();
+
+    // Peer-message bridge for non-interactive runs.
+    //
+    // When the claude-peers MCP server (or any MCP server using the
+    // `notifications/claude/channel` push protocol) delivers an inbound
+    // peer message, the patched McpClient handler appends a JSONL
+    // `{type:"submit", text:"..."}` line to the file watched by
+    // RemoteInputWatcher (the `--input-file` flag).
+    //
+    // Interactive mode initializes the watcher inside `startInteractiveUI`.
+    // Non-interactive mode previously did not — so pushed messages landed
+    // in the file but were never surfaced to the model. That meant a
+    // swarm-spawned worker (`kimi -p "task"`) could not be redirected,
+    // augmented, or aborted by the coordinator mid-task — only fire-and-
+    // forget dispatch was possible. This watcher closes that gap by
+    // queueing inbound peer messages and draining the queue at the next
+    // turn boundary, where they are appended to the user-content the
+    // model sees alongside any tool results. If a peer message arrives
+    // during the final response (no tool calls), the queue check forces
+    // the loop to continue with the peer messages as a new user turn
+    // rather than exiting.
+    const peerMessageQueue: string[] = [];
+    let peerInputWatcher: RemoteInputWatcher | null = null;
+    const peerInputFile = config.getInputFile?.();
+    if (peerInputFile) {
+      try {
+        peerInputWatcher = new RemoteInputWatcher(peerInputFile);
+        peerInputWatcher.setSubmitFn((text: string) => {
+          peerMessageQueue.push(text);
+          return true; // accepted into our queue; consumed at turn boundary
+        });
+      } catch (err) {
+        writeStderrLine(
+          `Warning: peer-message bridge disabled — ${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
+    }
+    const drainPeerMessages = (): Part[] => {
+      if (peerMessageQueue.length === 0) return [];
+      const drained = peerMessageQueue.splice(0);
+      debugLogger.debug(
+        `Peer-bridge: draining ${drained.length} pending peer message(s) into next turn`,
+      );
+      return drained.map((text) => ({ text }));
+    };
 
     interface LocalQueueItem {
       displayText: string;
@@ -815,8 +862,31 @@ export async function runNonInteractive(
             // post-loop branch — see emitStructuredSuccess above.
             return emitStructuredSuccess();
           }
+          // The model is mid-tool-cycle. Send only the tool results back;
+          // peer messages queued during this turn stay buffered and are
+          // surfaced once the tool-call chain completes (else-branch
+          // below). Mixing text parts with functionResponse parts in the
+          // same user-content block is rejected/hung by kimi-k2.6 served
+          // via the firm router — observed silent 2-minute timeouts when
+          // injecting peer text alongside tool responses. The cost of
+          // this restraint is that peer messages can't *interrupt* a
+          // tool chain; they're delivered at the next quiescent point.
           currentMessages = [{ role: 'user', parts: toolResponseParts }];
         } else {
+          // No tool calls — the model produced a final response, so the
+          // current tool-chain is quiescent. If peer messages arrived
+          // during this turn (or earlier turns while the chain was
+          // running), surface them now as a fresh user query and continue
+          // the main loop. This is what makes coordinator redirect /
+          // augment / abort work for swarm-spawned workers: the model
+          // finishes whatever tool sequence it's mid-way through, then
+          // sees the queued peer messages as its next user input.
+          const peerParts = drainPeerMessages();
+          if (peerParts.length > 0) {
+            currentMessages = [{ role: 'user', parts: peerParts }];
+            isFirstTurn = true; // next call uses UserQuery, not ToolResult
+            continue;
+          }
           // Drain-turns count toward getMaxSessionTurns() for symmetry with the main
           // loop — otherwise a looping cron or a model that keeps replying to
           // notifications could exceed the cap silently in headless runs.
